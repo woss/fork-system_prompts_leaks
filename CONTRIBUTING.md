@@ -21,7 +21,3 @@ Thanks for helping grow this collection! Here's how to contribute.
 ## Requesting a prompt
 
 Don't have the prompt yourself? [Open an issue](https://github.com/asgeirtj/system_prompts_leaks/issues) with the model or product name and we'll try to track it down.
-
-## Updating an existing prompt
-
-Models get updated. If you have a newer version of an existing prompt, either update the file or add a new one with the version in the filename. Move the old one to the `old/` subfolder if applicable.
