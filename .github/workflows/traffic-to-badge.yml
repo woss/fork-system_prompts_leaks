@@ -12,6 +12,8 @@ jobs:
   traffic:
     name: Collect traffic and generate badges
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,6 +38,9 @@ jobs:
           views_week_color: '30A14E'
           clones_week_color: '30A14E'
           logo: github
+
+      - name: Accumulate history and build dashboard
+        run: python3 .github/scripts/accumulate-traffic.py "${{ steps.traffic.outputs.traffic_path }}"
 
       - name: Deploy to traffic branch
         uses: peaceiris/actions-gh-pages@v4
