@@ -150,6 +150,8 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
   .badge-up{background:rgba(16,185,129,.15);color:#10b981}
   .badge-down{background:rgba(239,68,68,.15);color:#ef4444}
   .badge-new{background:rgba(99,102,241,.15);color:#6366f1}
+  .stat-since{font-size:.6rem;margin-top:6px;padding:2px 7px;background:rgba(99,102,241,.08);color:#6366f1;border-radius:4px;display:inline-block;font-weight:600;letter-spacing:.02em}
+  @media(prefers-color-scheme:dark){.stat-since{background:rgba(99,102,241,.15);color:#818cf8}}
   .drill-info{text-align:center;font-size:.75rem;color:var(--text2);margin-top:4px}
 </style>
 </head>
@@ -160,10 +162,9 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 <p class="subtitle">Traffic dashboard — auto-updated daily from the <code>traffic</code> branch</p>
 <div class="stats" id="stats"></div>
 <div class="card"><div class="card-title">Daily Views</div><div id="viewsChart"></div><p class="drill-info">Drag to zoom — click Reset to restore</p></div>
-<div class="card"><div class="card-title">Daily Clones</div><div id="clonesChart"></div></div>
 <div class="grid-2">
-  <div class="card"><div class="card-title">Top Pages (14-day window)</div><table id="pathsTable"></table></div>
-  <div class="card"><div class="card-title">Top Referrers (14-day window)</div><table id="refsTable"></table></div>
+  <div class="card"><div class="card-title">Top Pages (top 20 — peak 14-day count across all snapshots)</div><table id="pathsTable"></table></div>
+  <div class="card"><div class="card-title">Top Referrers (top 20 — peak 14-day count across all snapshots)</div><table id="refsTable"></table></div>
 </div>
 <p class="section">All Referrers — peak 14-day count per source across all snapshots</p>
 <div class="card"><div id="allRefsChart"></div></div>
@@ -173,6 +174,8 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 <div class="card"><div id="pathTrendChart"></div></div>
 <p class="section">Day Detail</p>
 <div class="card"><div class="card-title" id="dayDetailTitle">Click a day on the views chart to see that day's breakdown</div><div id="dayDetail" style="min-height:60px"></div></div>
+<p class="section">Daily Clones</p>
+<div class="card"><div id="clonesChart"></div></div>
 
 <script>
 const DATA = __DATA_PLACEHOLDER__;
@@ -200,14 +203,17 @@ const last7 = vDays.slice(-7).reduce((s,d) => s + d.count, 0);
 const prev7 = vDays.slice(-14,-7).reduce((s,d) => s + d.count, 0);
 const trend = prev7 ? Math.round((last7 - prev7) / prev7 * 100) : 0;
 const trendCls = trend >= 0 ? 'trend-up' : 'trend-down';
+const sinceStart = new Date(vDays[0].timestamp);
+const sinceFmt = sinceStart.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
+const dayCount = Math.round((Date.now() - sinceStart.getTime()) / 86400000);
 
 document.getElementById('stats').innerHTML = [
-  { l:'Total Views', v:fmt(views.count), s:fmt(views.uniques)+' unique' },
+  { l:'Total Views', v:fmt(views.count), s:fmt(views.uniques)+' unique', t:`since ${sinceFmt} · ${dayCount}d` },
   { l:'Total Clones', v:fmt(clones.count), s:fmt(clones.uniques)+' unique' },
   { l:'Daily Avg', v:fmt(avgViews), s:fmt(Math.round(clones.count/cDays.length))+' clones' },
   { l:'Peak Day', v:fmt(peakView.count), s:peakView.timestamp.slice(0,10) },
   { l:'7-Day Trend', v:`<span class="${trendCls}">${trend>=0?'+':''}${trend}%</span>`, s:fmt(last7)+' vs '+fmt(prev7) },
-].map(s=>`<div class="stat"><div class="stat-label">${s.l}</div><div class="stat-val">${s.v}</div><div class="stat-sub">${s.s}</div></div>`).join('');
+].map(s=>`<div class="stat"><div class="stat-label">${s.l}</div><div class="stat-val">${s.v}</div><div class="stat-sub">${s.s}</div>${s.t?`<div class="stat-since">${s.t}</div>`:''}</div>`).join('');
 
 const baseOpts = { chart:{fontFamily:'Inter,-apple-system,system-ui,sans-serif',background:'transparent',foreColor:isDark?'#94a3b8':'#6b7280',toolbar:{show:true,tools:{download:true,selection:true,zoom:true,zoomin:false,zoomout:false,pan:false,reset:true}}}, theme:{mode:apexTheme()}, grid:{borderColor:isDark?'#1e293b':'#e5e7eb',strokeDashArray:3}, tooltip:{theme:apexTheme()}, };
 
@@ -246,27 +252,34 @@ new ApexCharts(document.getElementById('clonesChart'), {
   legend:{position:'top',horizontalAlign:'left',fontSize:'12px'},
 }).render();
 
-const latestPaths = DATA.paths_series.length ? DATA.paths_series[DATA.paths_series.length-1].paths : [];
 const latestRefs = DATA.referrer_series.length ? DATA.referrer_series[DATA.referrer_series.length-1].referrers : [];
 const prevRefs = DATA.referrer_series.length > 7 ? DATA.referrer_series[DATA.referrer_series.length-8].referrers : null;
 
-document.getElementById('pathsTable').innerHTML = '<thead><tr><th>#</th><th>Page</th><th>Views</th><th>Unique</th></tr></thead><tbody>'+
-  latestPaths.map((p,i)=>{
-    const w = Math.round(p.count/(latestPaths[0]?.count||1)*100);
-    return `<tr><td style="color:var(--text2)">${i+1}</td><td class="bar-wrap"><div class="bar-fill" style="width:${w}%;background:${colors[i]}"></div><span class="mono">${shortenPath(p.path)}</span></td><td>${fmt(p.count)}</td><td>${fmt(p.uniques)}</td></tr>`;
-  }).join('')+'</tbody>';
-
-document.getElementById('refsTable').innerHTML = '<thead><tr><th>#</th><th>Referrer</th><th>Views</th><th>Unique</th></tr></thead><tbody>'+
-  latestRefs.map((r,i)=>{
-    const w = Math.round(r.count/(latestRefs[0]?.count||1)*100);
-    let badge = '';
-    if(prevRefs){ const p=prevRefs.find(x=>x.referrer===r.referrer); if(p){const d=Math.round((r.count-p.count)/p.count*100); if(d!==0) badge=`<span class="badge ${d>0?'badge-up':'badge-down'}">${d>0?'+':''}${d}%</span>`;}else{badge='<span class="badge badge-new">new</span>';}}
-    return `<tr><td style="color:var(--text2)">${i+1}</td><td class="bar-wrap"><div class="bar-fill" style="width:${w}%;background:${colors[i]}"></div>${r.referrer}${badge}</td><td>${fmt(r.count)}</td><td>${fmt(r.uniques)}</td></tr>`;
-  }).join('')+'</tbody>';
+// GitHub's API only returns 10 paths/referrers per snapshot, so aggregate the
+// peak 14-day count per source across all snapshots to surface up to 20.
+const allPathsMap = {};
+DATA.paths_series.forEach(s=>s.paths.forEach(p=>{ if(!allPathsMap[p.path]||p.count>allPathsMap[p.path].count) allPathsMap[p.path]={count:p.count,uniques:p.uniques,peak:s.date}; }));
+const allPaths = Object.entries(allPathsMap).sort((a,b)=>b[1].count-a[1].count);
 
 const allRefsMap = {};
 DATA.referrer_series.forEach(s=>s.referrers.forEach(r=>{ if(!allRefsMap[r.referrer]||r.count>allRefsMap[r.referrer].count) allRefsMap[r.referrer]={count:r.count,uniques:r.uniques,peak:s.date}; }));
 const allRefs = Object.entries(allRefsMap).sort((a,b)=>b[1].count-a[1].count);
+
+const topPaths = allPaths.slice(0,20);
+document.getElementById('pathsTable').innerHTML = '<thead><tr><th>#</th><th>Page</th><th>Peak Views</th><th>Unique</th></tr></thead><tbody>'+
+  topPaths.map(([path,d],i)=>{
+    const w = Math.round(d.count/(topPaths[0]?.[1].count||1)*100);
+    return `<tr><td style="color:var(--text2)">${i+1}</td><td class="bar-wrap"><div class="bar-fill" style="width:${w}%;background:${colors[i%colors.length]}"></div><span class="mono">${shortenPath(path)}</span></td><td>${fmt(d.count)}</td><td>${fmt(d.uniques)}</td></tr>`;
+  }).join('')+'</tbody>';
+
+const topRefs = allRefs.slice(0,20);
+document.getElementById('refsTable').innerHTML = '<thead><tr><th>#</th><th>Referrer</th><th>Peak Views</th><th>Unique</th></tr></thead><tbody>'+
+  topRefs.map(([ref,d],i)=>{
+    const w = Math.round(d.count/(topRefs[0]?.[1].count||1)*100);
+    let badge = '';
+    if(prevRefs){ const cur=latestRefs.find(x=>x.referrer===ref); const p=prevRefs.find(x=>x.referrer===ref); if(cur&&p){const delta=Math.round((cur.count-p.count)/p.count*100); if(delta!==0) badge=`<span class="badge ${delta>0?'badge-up':'badge-down'}">${delta>0?'+':''}${delta}%</span>`;}else if(cur&&!p){badge='<span class="badge badge-new">new</span>';}}
+    return `<tr><td style="color:var(--text2)">${i+1}</td><td class="bar-wrap"><div class="bar-fill" style="width:${w}%;background:${colors[i%colors.length]}"></div>${ref}${badge}</td><td>${fmt(d.count)}</td><td>${fmt(d.uniques)}</td></tr>`;
+  }).join('')+'</tbody>';
 
 new ApexCharts(document.getElementById('allRefsChart'), {
   ...baseOpts,
@@ -302,7 +315,7 @@ new ApexCharts(document.getElementById('refTrendChart'), {
 
 const allPathNames = new Set();
 DATA.paths_series.forEach(s=>s.paths.forEach(p=>allPathNames.add(p.path)));
-const topPathNames = [...allPathNames].map(n=>({n,c:(latestPaths.find(p=>p.path===n)||{count:0}).count})).sort((a,b)=>b.c-a.c).slice(0,6).map(x=>x.n);
+const topPathNames = [...allPathNames].map(n=>({n,c:(allPathsMap[n]||{count:0}).count})).sort((a,b)=>b.c-a.c).slice(0,6).map(x=>x.n);
 
 new ApexCharts(document.getElementById('pathTrendChart'), {
   ...baseOpts,
