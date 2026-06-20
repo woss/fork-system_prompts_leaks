@@ -92,6 +92,44 @@ def fetch_star_count():
         print(f"Star fetch failed: {e}")
         return None
 
+def fetch_star_windows():
+    """Real stars gained in rolling 1d / 7d / 30d windows, counted from live
+    starredAt timestamps (GraphQL, newest-first). Matches GitHub's own numbers
+    and is independent of snapshot timing. Returns None on failure."""
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
+        return None
+    now = datetime.now(timezone.utc)
+    bounds = {"d1": now.timestamp() - 86400, "d7": now.timestamp() - 7*86400, "d30": now.timestamp() - 30*86400}
+    counts = {"d1": 0, "d7": 0, "d30": 0}
+    cursor, pages = None, 0
+    try:
+        while pages < 60:
+            after = f', after: "{cursor}"' if cursor else ''
+            query = ('{ repository(owner:"asgeirtj", name:"system_prompts_leaks"){ stargazers(first:100%s, '
+                     'orderBy:{field:STARRED_AT, direction:DESC}){ pageInfo{endCursor hasNextPage} edges{starredAt} } } }') % after
+            body = json.dumps({"query": query}).encode()
+            req = urllib.request.Request("https://api.github.com/graphql", data=body,
+                headers={"Authorization": f"Bearer {token}", "User-Agent": "traffic-dashboard", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                s = json.load(r)["data"]["repository"]["stargazers"]
+            oldest = now.timestamp()
+            for e in s["edges"]:
+                t = datetime.fromisoformat(e["starredAt"].replace("Z", "+00:00")).timestamp()
+                oldest = t
+                for k, b in bounds.items():
+                    if t >= b:
+                        counts[k] += 1
+            pages += 1
+            if oldest < bounds["d30"] or not s["pageInfo"]["hasNextPage"]:
+                break
+            cursor = s["pageInfo"]["endCursor"]
+        print(f"Star windows: today={counts['d1']} 7d={counts['d7']} 30d={counts['d30']} ({pages} pages)")
+        return counts
+    except Exception as e:
+        print(f"Star windows fetch failed: {e}")
+        return None
+
 def accumulate_stars(publish_dir):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     data_dir = os.path.join(publish_dir, TRAFFIC_DIR)
@@ -115,9 +153,9 @@ def accumulate_stars(publish_dir):
         json.dump(star_history, f, separators=(",", ":"))
 
     print(f"Accumulated: {len(star_history)} star snapshots (latest={star_history[-1]['stars'] if star_history else 'n/a'})")
-    return star_history
+    return star_history, fetch_star_windows()
 
-def build_dashboard(publish_dir, ref_history, path_history, star_history):
+def build_dashboard(publish_dir, ref_history, path_history, star_history, star_windows):
     data_dir = os.path.join(publish_dir, TRAFFIC_DIR)
     views = load_json(os.path.join(data_dir, "traffic_views.json"))
     clones = load_json(os.path.join(data_dir, "traffic_clones.json"))
@@ -132,6 +170,7 @@ def build_dashboard(publish_dir, ref_history, path_history, star_history):
         "referrer_series": ref_history,
         "paths_series": path_history,
         "stars_series": star_history,
+        "stars_windows": star_windows,
     }, separators=(",", ":"))
 
     html = DASHBOARD_TEMPLATE.replace("__DATA_PLACEHOLDER__", embedded)
@@ -207,7 +246,9 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 <p class="subtitle">Traffic dashboard — auto-updated daily from the <code>traffic</code> branch</p>
 <div class="stats" id="stats"></div>
 <div class="card"><div class="card-title">Daily Views</div><div id="viewsChart"></div><p class="drill-info">Drag to zoom — click Reset to restore</p></div>
-<div class="card"><div class="card-title">GitHub Stars (cumulative)</div><div id="starsChart"></div><p class="drill-info">Bars show stars gained per day · drag to zoom</p></div>
+<div class="card"><div class="card-title" style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">GitHub Stars (cumulative)<span id="starReadout" style="font-weight:600;font-size:.78rem;color:var(--text2)"></span></div><div id="starsChart"></div><p class="drill-info">Bars show stars gained per day · drag to zoom</p></div>
+<p class="section">Page Trends — daily 14-day view count for the top pages</p>
+<div class="card"><label style="display:inline-flex;align-items:center;gap:6px;font-size:.75rem;color:var(--text2);margin-bottom:8px;cursor:pointer"><input type="checkbox" id="showAgg" style="cursor:pointer"> Show folders, root &amp; overview</label><div id="pathTrendChart"></div></div>
 <div class="grid-2">
   <div class="card"><div class="card-title">Top Pages (top 20 — peak 14-day count across all snapshots)</div><table id="pathsTable"></table></div>
   <div class="card"><div class="card-title">Top Referrers (top 20 — peak 14-day count across all snapshots)</div><table id="refsTable"></table></div>
@@ -216,8 +257,6 @@ DASHBOARD_TEMPLATE = r"""<!DOCTYPE html>
 <div class="card"><div id="allRefsChart"></div></div>
 <p class="section">Referrer Trends</p>
 <div class="card"><div id="refTrendChart"></div></div>
-<p class="section">Page Trends</p>
-<div class="card"><div id="pathTrendChart"></div></div>
 <p class="section">Day Detail</p>
 <div class="card"><div class="card-title" id="dayDetailTitle">Click a day on the views chart to see that day's breakdown</div><div id="dayDetail" style="min-height:60px"></div></div>
 <p class="section">Daily Clones</p>
@@ -255,13 +294,39 @@ const dayCount = Math.round((Date.now() - sinceStart.getTime()) / 86400000);
 
 const starSeries = (DATA.stars_series||[]).slice().sort((a,b)=>a.date.localeCompare(b.date));
 const curStars = starSeries.length ? starSeries[starSeries.length-1].stars : null;
-// stars gained over the trailing 7 days (find the snapshot ~7 days back)
-let starGain7 = null;
-if (starSeries.length > 1) {
-  const cutoff = new Date(starSeries[starSeries.length-1].date); cutoff.setDate(cutoff.getDate()-7);
+// stars gained over the trailing ~7 days. The backfill ends at the API's
+// 40k-stargazer cap, so early on there's a multi-week gap before today's
+// point — label the gain by its TRUE span so it never claims "7d" for a
+// 36-day delta. Self-heals to "7d" once daily points fill in.
+// gain over the trailing N days: find the snapshot ~N days back and subtract.
+// Returns {gain, days} where days is the TRUE span covered (so it never claims
+// "7d" for a wider gap left by the one-time 40k-cap backfill seam).
+function starGainOver(n) {
+  if (starSeries.length < 2) return null;
+  const lastDate = new Date(starSeries[starSeries.length-1].date);
+  const cutoff = new Date(lastDate); cutoff.setDate(cutoff.getDate()-n);
   let base = starSeries[0];
   for (const p of starSeries) { if (new Date(p.date) <= cutoff) base = p; }
-  starGain7 = curStars - base.stars;
+  return { gain: curStars - base.stars, days: Math.round((lastDate - new Date(base.date)) / 86400000) || 1 };
+}
+// Prefer live rolling-window counts (real starredAt timestamps, matches
+// GitHub's own numbers); fall back to the daily series if that fetch failed.
+const sw = DATA.stars_windows;
+const g7s = starGainOver(7);
+const starGain = sw ? sw.d7 : (g7s ? g7s.gain : null);
+const starGainDays = 7;
+
+if (curStars != null) {
+  let parts;
+  if (sw) {
+    parts = [['today',sw.d1],['7d',sw.d7],['30d',sw.d30]];
+  } else {
+    parts = [['today',starGainOver(1)?.gain],['7d',starGainOver(7)?.gain],['30d',starGainOver(30)?.gain]];
+  }
+  document.getElementById('starReadout').innerHTML = parts
+    .filter(([,v])=>v!=null)
+    .map(([l,v])=>`<span class="${v>=0?'trend-up':'trend-down'}">${v>=0?'+':''}${fmt(v)}</span> ${l}`)
+    .join(' &nbsp;·&nbsp; ');
 }
 
 const statCards = [
@@ -271,7 +336,13 @@ const statCards = [
   { l:'Peak Day', v:fmt(peakView.count), s:peakView.timestamp.slice(0,10) },
   { l:'7-Day Trend', v:`<span class="${trendCls}">${trend>=0?'+':''}${trend}%</span>`, s:fmt(last7)+' vs '+fmt(prev7) },
 ];
-if (curStars != null) statCards.splice(2, 0, { l:'GitHub Stars', v:'★ '+fmt(curStars), s: starGain7!=null ? `<span class="${starGain7>=0?'trend-up':'trend-down'}">${starGain7>=0?'+':''}${fmt(starGain7)}</span> last 7d` : '&nbsp;' });
+if (curStars != null) {
+  const tdy = sw ? sw.d1 : null;
+  const sub = sw
+    ? `<span class="trend-up">+${fmt(sw.d1)}</span> today · <span class="trend-up">+${fmt(sw.d7)}</span> 7d`
+    : (starGain!=null ? `<span class="${starGain>=0?'trend-up':'trend-down'}">${starGain>=0?'+':''}${fmt(starGain)}</span> last ${starGainDays}d` : '&nbsp;');
+  statCards.splice(2, 0, { l:'GitHub Stars', v:'★ '+fmt(curStars), s: sub });
+}
 
 document.getElementById('stats').innerHTML = statCards.map(s=>`<div class="stat"><div class="stat-label">${s.l}</div><div class="stat-val">${s.v}</div><div class="stat-sub">${s.s}</div>${s.t?`<div class="stat-since">${s.t}</div>`:''}</div>`).join('');
 
@@ -298,8 +369,22 @@ new ApexCharts(document.getElementById('viewsChart'), {
 }).render();
 
 if (starSeries.length) {
-  const cumData = starSeries.map(p=>[new Date(p.date).getTime(), p.stars]);
-  const deltaData = starSeries.map((p,i)=>[new Date(p.date).getTime(), i===0?p.stars:Math.max(0,p.stars-starSeries[i-1].stars)]);
+  // Build daily points. If two snapshots are >1 day apart (e.g. the tracker
+  // missed a few days), spread the gain evenly across the missing days so a
+  // multi-day delta never renders as one false single-day spike.
+  const cumData = [], deltaData = [];
+  starSeries.forEach((p,i)=>{
+    const t = new Date(p.date).getTime();
+    if (i===0) { cumData.push([t,p.stars]); deltaData.push([t,p.stars]); return; }
+    const prev = starSeries[i-1], pt = new Date(prev.date).getTime();
+    const days = Math.max(1, Math.round((t-pt)/86400000));
+    const per = (p.stars - prev.stars) / days;
+    for (let k=1;k<=days;k++) {
+      const tk = pt + k*86400000;
+      cumData.push([tk, k===days ? p.stars : Math.round(prev.stars + per*k)]);
+      deltaData.push([tk, Math.round(per)]);
+    }
+  });
   new ApexCharts(document.getElementById('starsChart'), {
     ...baseOpts,
     chart:{...baseOpts.chart, type:'line', height:320, id:'stars', zoom:{enabled:true,type:'x',autoScaleYaxis:true}},
@@ -345,18 +430,23 @@ const prevRefs = DATA.referrer_series.length > 7 ? DATA.referrer_series[DATA.ref
 // peak 14-day count per source across all snapshots to surface up to 20.
 const allPathsMap = {};
 DATA.paths_series.forEach(s=>s.paths.forEach(p=>{ if(!allPathsMap[p.path]||p.count>allPathsMap[p.path].count) allPathsMap[p.path]={count:p.count,uniques:p.uniques,peak:s.date}; }));
-const allPaths = Object.entries(allPathsMap).sort((a,b)=>b[1].count-a[1].count);
+// A path is a real file page if it's a /blob/main/ URL; everything else
+// (the repo Overview, /tree/main root, and /tree/main/<dir> folder listings)
+// is an aggregate view that the toggle can hide.
+const isFilePath = p => p.replace('/asgeirtj/system_prompts_leaks','').startsWith('/blob/main/');
 
 const allRefsMap = {};
 DATA.referrer_series.forEach(s=>s.referrers.forEach(r=>{ if(!allRefsMap[r.referrer]||r.count>allRefsMap[r.referrer].count) allRefsMap[r.referrer]={count:r.count,uniques:r.uniques,peak:s.date}; }));
 const allRefs = Object.entries(allRefsMap).sort((a,b)=>b[1].count-a[1].count);
 
-const topPaths = allPaths.slice(0,20);
-document.getElementById('pathsTable').innerHTML = '<thead><tr><th>#</th><th>Page</th><th>Peak Views</th><th>Unique</th></tr></thead><tbody>'+
-  topPaths.map(([path,d],i)=>{
-    const w = Math.round(d.count/(topPaths[0]?.[1].count||1)*100);
-    return `<tr><td style="color:var(--text2)">${i+1}</td><td class="bar-wrap"><div class="bar-fill" style="width:${w}%;background:${colors[i%colors.length]}"></div><span class="mono">${shortenPath(path)}</span></td><td>${fmt(d.count)}</td><td>${fmt(d.uniques)}</td></tr>`;
-  }).join('')+'</tbody>';
+function renderTopPagesTable(showAgg) {
+  const topPaths = Object.entries(allPathsMap).filter(([p])=>showAgg||isFilePath(p)).sort((a,b)=>b[1].count-a[1].count).slice(0,20);
+  document.getElementById('pathsTable').innerHTML = '<thead><tr><th>#</th><th>Page</th><th>Peak Views</th><th>Unique</th></tr></thead><tbody>'+
+    topPaths.map(([path,d],i)=>{
+      const w = Math.round(d.count/(topPaths[0]?.[1].count||1)*100);
+      return `<tr><td style="color:var(--text2)">${i+1}</td><td class="bar-wrap"><div class="bar-fill" style="width:${w}%;background:${colors[i%colors.length]}"></div><span class="mono">${shortenPath(path)}</span></td><td>${fmt(d.count)}</td><td>${fmt(d.uniques)}</td></tr>`;
+    }).join('')+'</tbody>';
+}
 
 const topRefs = allRefs.slice(0,20);
 document.getElementById('refsTable').innerHTML = '<thead><tr><th>#</th><th>Referrer</th><th>Peak Views</th><th>Unique</th></tr></thead><tbody>'+
@@ -373,8 +463,8 @@ new ApexCharts(document.getElementById('allRefsChart'), {
   series:[{name:'Peak 14-day views',data:allRefs.map(([,d])=>d.count)},{name:'Unique',data:allRefs.map(([,d])=>d.uniques)}],
   colors:['#6366f1','#f59e0b'],
   plotOptions:{bar:{horizontal:true,borderRadius:4,barHeight:'65%',dataLabels:{position:'top'}}},
-  xaxis:{labels:{formatter:v=>v>=1000?(v/1000).toFixed(0)+'k':v}},
-  yaxis:{labels:{style:{fontSize:'11px'}},categories:allRefs.map(([n])=>n)},
+  xaxis:{categories:allRefs.map(([n])=>n),labels:{formatter:v=>v>=1000?(v/1000).toFixed(0)+'k':v}},
+  yaxis:{labels:{style:{fontSize:'11px'}}},
   dataLabels:{enabled:false},
   tooltip:{y:{formatter:v=>fmt(v)}},
   legend:{position:'top',horizontalAlign:'left',fontSize:'12px'},
@@ -401,22 +491,38 @@ new ApexCharts(document.getElementById('refTrendChart'), {
 
 const allPathNames = new Set();
 DATA.paths_series.forEach(s=>s.paths.forEach(p=>allPathNames.add(p.path)));
-const topPathNames = [...allPathNames].map(n=>({n,c:(allPathsMap[n]||{count:0}).count})).sort((a,b)=>b.c-a.c).slice(0,6).map(x=>x.n);
 
-new ApexCharts(document.getElementById('pathTrendChart'), {
-  ...baseOpts,
-  chart:{...baseOpts.chart, type:'line', height:320, zoom:{enabled:true,type:'x'}},
-  series:topPathNames.map((name,i)=>({
-    name:shortenPath(name), data:DATA.paths_series.map(s=>{const p=s.paths.find(x=>x.path===name); return [new Date(s.date).getTime(), p?p.count:null];})
-  })),
-  colors:colors.slice(0,6),
-  stroke:{curve:'smooth',width:2},
-  xaxis:{type:'datetime'},
-  yaxis:{labels:{formatter:v=>v>=1000?(v/1000).toFixed(1)+'k':v}},
-  dataLabels:{enabled:false},
-  markers:{size:0,hover:{size:4}},
-  legend:{position:'top',fontSize:'11px'},
-}).render();
+// Page Trends + Top Pages share one toggle. Default hides aggregate paths
+// (Overview / root / folder listings) so only real file pages show; the
+// checkbox brings them back. Chart is destroyed/recreated on toggle.
+let pathTrendChart = null;
+function renderPageTrend(showAgg) {
+  const names = [...allPathNames].filter(n=>showAgg||isFilePath(n))
+    .map(n=>({n,c:(allPathsMap[n]||{count:0}).count})).sort((a,b)=>b.c-a.c).slice(0,8).map(x=>x.n);
+  if (pathTrendChart) pathTrendChart.destroy();
+  pathTrendChart = new ApexCharts(document.getElementById('pathTrendChart'), {
+    ...baseOpts,
+    chart:{...baseOpts.chart, type:'line', height:380, zoom:{enabled:true,type:'x'}},
+    series:names.map(name=>({
+      name:shortenPath(name), data:DATA.paths_series.map(s=>{const p=s.paths.find(x=>x.path===name); return [new Date(s.date).getTime(), p?p.count:null];})
+    })),
+    colors:colors.slice(0,8),
+    stroke:{curve:'smooth',width:2},
+    xaxis:{type:'datetime'},
+    yaxis:{labels:{formatter:v=>v>=1000?(v/1000).toFixed(1)+'k':v}},
+    dataLabels:{enabled:false},
+    markers:{size:0,hover:{size:4}},
+    legend:{position:'top',fontSize:'11px'},
+  });
+  pathTrendChart.render();
+}
+function renderPages() {
+  const showAgg = document.getElementById('showAgg').checked;
+  renderTopPagesTable(showAgg);
+  renderPageTrend(showAgg);
+}
+document.getElementById('showAgg').addEventListener('change', renderPages);
+renderPages();
 
 function showDayDetail(date) {
   if (!date) return;
@@ -430,15 +536,15 @@ function showDayDetail(date) {
   let html = '<div class="grid-2" style="gap:12px">';
   html += '<div><strong style="font-size:.75rem">Views:</strong> '+(day?fmt(day.count)+' ('+fmt(day.uniques)+' unique)':'no data')+'<br><strong style="font-size:.75rem">Clones:</strong> '+(clone?fmt(clone.count)+' ('+fmt(clone.uniques)+' unique)':'no data')+'</div>';
   if (snap) {
-    html += '<div><strong style="font-size:.75rem">Referrers (14-day window):</strong><br>';
-    snap.referrers.slice(0,5).forEach(r=>{ html += `<span class="mono" style="font-size:.7rem">${r.referrer}: ${fmt(r.count)}</span><br>`; });
+    html += `<div><strong style="font-size:.75rem">Referrers (14-day window, ${snap.referrers.length}):</strong><br>`;
+    snap.referrers.forEach(r=>{ html += `<span class="mono" style="font-size:.7rem">${r.referrer}: ${fmt(r.count)} (${fmt(r.uniques)} uniq)</span><br>`; });
     html += '</div>';
   }
   html += '</div>';
   if (pathSnap) {
-    html += '<div style="margin-top:8px"><strong style="font-size:.75rem">Top pages (14-day window):</strong>';
-    html += '<table style="margin-top:4px"><thead><tr><th>Page</th><th>Views</th></tr></thead><tbody>';
-    pathSnap.paths.slice(0,5).forEach(p=>{ html += `<tr><td class="mono">${shortenPath(p.path)}</td><td>${fmt(p.count)}</td></tr>`; });
+    html += `<div style="margin-top:8px"><strong style="font-size:.75rem">Top pages (14-day window, ${pathSnap.paths.length}):</strong>`;
+    html += '<table style="margin-top:4px"><thead><tr><th>Page</th><th>Views</th><th>Unique</th></tr></thead><tbody>';
+    pathSnap.paths.forEach(p=>{ html += `<tr><td class="mono">${shortenPath(p.path)}</td><td>${fmt(p.count)}</td><td>${fmt(p.uniques)}</td></tr>`; });
     html += '</tbody></table></div>';
   }
   el.innerHTML = html;
@@ -452,5 +558,5 @@ if __name__ == "__main__":
     publish_dir = sys.argv[1]
     print(f"Processing traffic data in {publish_dir}")
     ref_history, path_history = accumulate(publish_dir)
-    star_history = accumulate_stars(publish_dir)
-    build_dashboard(publish_dir, ref_history, path_history, star_history)
+    star_history, star_windows = accumulate_stars(publish_dir)
+    build_dashboard(publish_dir, ref_history, path_history, star_history, star_windows)
