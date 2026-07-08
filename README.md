@@ -8,7 +8,6 @@ The purpose of this repo is to document the System Prompt instructions for all t
   <img alt="ChatGPT leaking its system prompt after being asked to repeat all of the above" src=".github/banner-light.png">
 </picture>
 
-[![GitHub Views per Week](https://raw.githubusercontent.com/asgeirtj/system_prompts_leaks/traffic/traffic-system_prompts_leaks/views_per_week.svg)](https://github.com/asgeirtj/system_prompts_leaks)
 ![Last Commit](https://img.shields.io/github/last-commit/asgeirtj/system_prompts_leaks?style=flat)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](http://makeapullrequest.com)
 
@@ -253,8 +252,6 @@ The purpose of this repo is to document the System Prompt instructions for all t
 ![a](https://badgen.net/email/asgeirtj/gmail.com)
 [![X](https://img.shields.io/badge/@asgeirtj-black?logo=x&logoColor=white)](https://x.com/asgeirtj)
 
-
-## Growth
 
 ## Star History
 
